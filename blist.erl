@@ -1,11 +1,17 @@
 -module(blist).
 -export([
     empty/0, from_list/1, to_list/1,
-    count/1, nth/2, set/3, insert/3, pop/1, delete/2, append/2, concatenate/2,
-    split/2
+    count/1, nth/2, set/3, insert/3, pop/1, delete/2, append/2,
+    concatenate/2, split/2,
+    iter/1, next/1,
+    map/2, foreach/2, foldl/3, reverse/1
+    % , flatmap/2
 ]).
--export_type([blist/1]).
--export([test/0]).
+-export_type([blist/1, iter/1]).
+-export([
+    test_list/0
+    % , test_flatmap/0
+]).
 -moduledoc """
 Lists stored as balanced binary trees rather than as singly linked lists.
 
@@ -212,9 +218,15 @@ concatenate(Left, Right) ->
     if
         LeftHeight == RightHeight ->
             {Value, NewRight} = pop(Right),
+            %% rebalance is not needed here: NewRight has height either
+            %% RightHeight or RightHeight - 1, hence the new node is balanced.
             rebalance(new(Left, Value, NewRight));
         LeftHeight < RightHeight ->
             #node{left = RL, value = RV, right = RR} = Right,
+            %% rebalance *is* needed here.  in this branch, it's possible for
+            %% RL to have height RightHeight - 1, RR to have RightHeight - 2,
+            %% and for Left to have height equal to that of RL.  in that case,
+            %% NewLeft has height RightHeight, which is balanced against RR.
             NewLeft = concatenate(Left, RL),
             rebalance(new(NewLeft, RV, RR));
         LeftHeight > RightHeight ->
@@ -223,7 +235,9 @@ concatenate(Left, Right) ->
             rebalance(new(LL, LV, NewRight))
     end.
 
--doc "Splits a blist into left- and right-sub-blists: [0, Index) and [Index, ...).".
+-doc """
+Splits a blist into left- and right-sub-blists: [0, Index) and [Index, ...).
+""".
 -spec split(blist(T), non_neg_integer()) -> {blist(T), blist(T)}.
 split(Node, 0) ->
     {none, Node};
@@ -240,6 +254,127 @@ split(#node{left = Left, value = Value, right = Right}, Index) ->
             {concatenate(append(Left, Value), RL), RR}
     end.
 
+-doc "Applies a function to a blist, returning a new blist as a result.".
+-spec map(fun((S) -> T), blist(S)) -> blist(T).
+map(_F, none) -> none;
+map(F, #node{left = Left, value = Value, right = Right}) ->
+    new(map(F, Left), F(Value), map(F, Right)).
+
+-doc "Applies a function to a blist, discarding the result.".
+-spec foreach(fun((S) -> any()), blist(S)) -> ok.
+foreach(_F, none) -> ok;
+foreach(F, #node{left = Left, value = Value, right = Right}) ->
+    foreach(F, Left),
+    F(Value),
+    foreach(F, Right).
+
+-doc "Folds over a blist.".
+-spec foldl(fun((A, S) -> A), A, blist(S)) -> A.
+foldl(_F, A, none) -> A;
+foldl(F, A, #node{left = Left, value = Value, right = Right}) ->
+    AL = foldl(F, A, Left),
+    AV = F(AL, Value),
+    foldl(F, AV, Right).
+
+-doc "Reverses a blist.".
+-spec reverse(blist(S)) -> blist(S).
+reverse(none) -> none;
+reverse(#node{left = Left, value = Value, right = Right}) ->
+    new(reverse(Right), Value, reverse(Left)).
+
+-type iter(S) :: fun(() -> none | {S, iter(S)}).
+
+-doc "Constructs an iterator which traverses a B-list.".
+-spec iter(blist(S)) -> iter(S).
+iter(BList) ->
+    R = fun
+        R([]) ->
+            none;
+        R([{node, none} | XS]) ->
+            R(XS);
+        R([{value, X} | XS]) ->
+            {X, fun () -> R(XS) end};
+        R([{node, X} | XS]) ->
+            #node{left = Left, value = Value, right = Right} = X,
+            R([{node, Left}, {value, Value}, {node, Right} | XS])
+    end,
+    fun () -> R([{node, BList}]) end.
+
+-doc "Retrieves the next item from a B-list iterator.".
+-spec next(iter(B)) -> none | {B, iter(B)}.
+next(Iter) ->
+    Iter().
+
+%%% This next part was fun to right, but it seems strictly less performant; see
+%%% benchmark at bottom.
+
+% -doc "Applies a function to a blist, concatenating the results.".
+% -spec flatmap(fun((S) -> blist(T)), blist(S)) -> blist(T).
+% flatmap(F, List) ->
+%     flatmap(F, none, none, iter(List)).
+
+% %% "Top-level" workhorse for flatmap, used to catch the case where there is no
+% %% extra-efficient way to concatenate the next iteration value into the
+% %% partially formed tree.
+% %%
+% %% NOTE: Arguments are ordered by how they're going to end up concatenated in a
+% %% naive implementation: Left has the stable part of the tree, Right has the
+% %% next mapped value which we're trying to append, and Iter has the unmapped
+% %% remainder of the input tree which will go to the right of Right.
+% -doc false.
+% -spec flatmap(fun((S) -> blist(T)), blist(T), blist(T), none | iter(S)) -> blist(T).
+% flatmap(_F, Left, Right, none) ->
+%     concatenate(Left, Right);
+% flatmap(F, Left, Right, Iter) ->
+%     case next(Iter) of
+%         none ->
+%             concatenate(Left, Right);
+%         {Next, Rest} ->
+%             Joined = concatenate(Left, Right),
+%             {NewLeft, NewRight, NewIter} = flatmap_1(F, Joined, F(Next), Rest),
+%             flatmap(F, NewLeft, NewRight, NewIter)
+%     end.
+
+% %% Main workhorse for flatmap/4.  Its primary order of business is to walk up or
+% %% down Left in order to find a place to put Right.  Walking down is done by
+% %% recursion; walking up is done by returning / assuming that we're part of a
+% %% recursion.  (See flatmap/4 for base case.)  Whenever it successfully merges
+% %% Right (i.e., whenever Right is none), it pulls the next value from the
+% %% iterator to use as the new Right and tries again from the current depth.
+% %%
+% %% Returns {Left, Right, Iter} where either Iter is none or ht(Left) < ht(Right)
+% -doc false.
+% -spec flatmap_1(fun((S) -> blist(T)), blist(T), blist(T), none | iter(S)) ->
+%     {blist(T), blist(T), none | iter(S)}.
+% flatmap_1(_F, Left, _Right = none, _Iter = none) ->
+%     %% if Iter is exhausted and we're done merging, finish
+%     {Left, none, none};
+% flatmap_1(F, Left, _Right = none, Iter) ->
+%     %% Right has finished merging in
+%     case next(Iter) of
+%         none ->  % exhausted case
+%             {Left, none, none};
+%         {Next, Rest} ->  % re-call with next item from Iter
+%             flatmap_1(F, Left, F(Next), Rest)
+%     end;
+% flatmap_1(F, Left, Right, Iter) ->
+%     %% Right is nontrivial.  walk up or down to find a place to put it.
+%     LeftHeight = height(Left),
+%     RightHeight = height(Right),
+%     if
+%         LeftHeight > RightHeight ->
+%             %% Left is deeper than Right. Descend along Left.
+%             #node{left = LL, value = LV, right = LR} = Left,
+%             {NewLR, NewRight, NewIter} = flatmap_1(F, LR, Right, Iter),
+%             NewLeft = concatenate(append(LL, LV), NewLR),
+%             flatmap_1(F, NewLeft, NewRight, NewIter);
+%         LeftHeight == RightHeight ->
+%             NewLeft = concatenate(Left, Right),
+%             flatmap_1(F, NewLeft, none, Iter);
+%         LeftHeight < RightHeight ->
+%             {Left, Right, Iter}
+%     end.
+
 %%%
 %%% BENCHMARK
 %%%
@@ -253,8 +388,8 @@ insert_list(A, 0, X) -> [X | A];
 insert_list([A | B], N, X) -> [A | insert_list(B, N - 1, X)].
 
 -doc "Benchmark.".
--spec test() -> ok.
-test() ->
+-spec test_list() -> ok.
+test_list() ->
     SIZE = 100000,
     OPCOUNT = 10000,
     List = lists:seq(1, SIZE),
@@ -278,4 +413,22 @@ test() ->
     BListEnd = os:system_time(microsecond),
     BListDelta = BListEnd - BListStart,
 
-    io:format("List: ~p~nBList: ~p~n", [ListDelta, BListDelta]).
+    io:format("List: ~pus~nBList: ~pus~n", [ListDelta, BListDelta]).
+
+% -doc "Benchmark.".
+% -spec test_flatmap() -> ok.
+% test_flatmap() ->
+%     F = fun(X) -> from_list([X, X * 2, X * 3, X * 4]) end,
+%     Inputs = blist:from_list(lists:seq(1, 100000)),
+
+%     FoldStart = os:system_time(microsecond),
+%     foldl(fun(Acc, E) -> concatenate(Acc, F(E)) end, empty(), Inputs),
+%     FoldEnd = os:system_time(microsecond),
+%     FoldDelta = FoldEnd - FoldStart,
+
+%     FlatmapStart = os:system_time(microsecond),
+%     flatmap(F, Inputs),
+%     FlatmapEnd = os:system_time(microsecond),
+%     FlatmapDelta = FlatmapEnd - FlatmapStart,
+
+%     io:format("foldl: ~pus~nflatmap: ~pus~n", [FoldDelta, FlatmapDelta]).
